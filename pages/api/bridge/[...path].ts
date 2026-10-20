@@ -1,7 +1,7 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 import { getDb } from "@/lib/db";
 import { decryptSecret } from "@/lib/crypto";
-import { apolloLookup, BridgeError, configFromEnv, applyAccountLimits, enrolLeads, readEvents, setCampaignStatus, unenrolLead } from "@/lib/bridge";
+import { apolloLookup, BridgeError, configFromEnv, applyAccountLimits, enrolLeads, eraseLead, readEvents, setCampaignStatus, unenrolLead } from "@/lib/bridge";
 
 /**
  * Careervira Console bridge. One catch-all route so the whole contract is in one place.
@@ -15,7 +15,7 @@ import { apolloLookup, BridgeError, configFromEnv, applyAccountLimits, enrolLead
  */
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   const parts = ([] as string[]).concat(req.query.path ?? []);
-  const key = `${req.method} ${parts.length === 3 && parts[0] === "campaigns" ? `campaigns/:id/${parts[2]}` : parts.length === 2 && parts[0] === "leads" ? "leads/:id" : parts.join("/")}`;
+  const key = `${req.method} ${parts.length === 3 && parts[0] === "campaigns" ? `campaigns/:id/${parts[2]}` : parts.length === 2 && parts[0] === "leads" ? "leads/:id" : parts.length === 3 && parts[0] === "leads" && parts[2] === "erase" ? "leads/:id/erase" : parts.join("/")}`;
   try {
     const db = getDb();
     switch (key) {
@@ -35,6 +35,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       case "POST campaigns/:id/pause": return res.json(setCampaignStatus(db, parts[1], "pause"));
       case "POST campaigns/:id/stop": return res.json(setCampaignStatus(db, parts[1], "stop"));
       case "DELETE leads/:id": return res.json(unenrolLead(db, parts[1]));
+      case "DELETE leads/:id/erase": return res.json(eraseLead(db, parts[1]));
       case "GET events": {
         const limit = Number(req.query.limit ?? 200);
         return res.json(readEvents(db, typeof req.query.after === "string" ? req.query.after : null, limit));

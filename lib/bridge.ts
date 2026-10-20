@@ -242,6 +242,35 @@ function setCampaignStatusInner(db: Db, externalCampaignId: string, action: "sta
   return { status: "completed" };
 }
 
+/**
+ * Erases a person completely: their contact record, sequence progress, messages, replies, notes and logs.
+ * Used when someone asks to be forgotten. Unknown person is fine (already gone). Never sends anything.
+ */
+export function eraseLead(db: Db, externalLeadId: string) {
+  const targets = db.prepare("SELECT id FROM targets WHERE external_id = ?").all(externalLeadId) as { id: string }[];
+  const tables = (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").all() as { name: string }[]).map((t) => t.name);
+  const hasCol = (table: string, col: string) => (db.prepare(`PRAGMA table_info("${table}")`).all() as { name: string }[]).some((c) => c.name === col);
+  let removed = 0;
+  db.transaction(() => {
+    for (const t of targets) {
+      // Things hanging off this person's place in a run (steps, tracks) go first.
+      const profiles = (hasTable(tables, "run_profiles") ? db.prepare("SELECT id FROM run_profiles WHERE target_id = ?").all(t.id) : []) as { id: string }[];
+      for (const table of tables) {
+        if (table === "run_profiles" || table === "targets") continue;
+        if (hasCol(table, "run_profile_id")) for (const p of profiles) removed += db.prepare(`DELETE FROM "${table}" WHERE run_profile_id = ?`).run(p.id).changes;
+      }
+      for (const table of tables) {
+        if (table === "targets") continue;
+        if (hasCol(table, "target_id")) removed += db.prepare(`DELETE FROM "${table}" WHERE target_id = ?`).run(t.id).changes;
+      }
+      removed += db.prepare("DELETE FROM targets WHERE id = ?").run(t.id).changes;
+    }
+    db.prepare("DELETE FROM bridge_events WHERE external_lead_id = ?").run(externalLeadId);
+  })();
+  return { erased: targets.length > 0, rows_removed: removed };
+}
+const hasTable = (tables: string[], name: string) => tables.includes(name);
+
 /** Takes one lead out of every sequence. Unknown leads are fine (already gone). */
 export function unenrolLead(db: Db, externalLeadId: string) {
   const t = db.prepare("SELECT id FROM targets WHERE external_id = ?").get(externalLeadId) as { id: string } | undefined;

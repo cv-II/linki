@@ -117,3 +117,34 @@ test("Apollo lookup: found, not found, and the whole-batch problems", async () =
   let sent: any; await B.apolloLookup("k", { linkedin_url: "https://www.linkedin.com/in/x", name: "N" }, (async (_u: any, init: any) => { sent = JSON.parse(init.body); return new Response("{}"); }) as any);
   assert.equal(sent.linkedin_url, "https://www.linkedin.com/in/x"); assert.equal(sent.name, undefined);
 });
+
+test("erasing a person removes every trace of them, leaves other people alone, and is safe to repeat", () => {
+  const a = lead(901, { name: "Erase Me Person", email: "erase.me@example.com" });
+  const b = lead(902, { name: "Keep Me Person", email: "keep.me@example.com" });
+  B.enrolLeads(db, "camp-erase", [a, b], { workflowId: "wf1" }, "Erase test");
+  const tid = (db.prepare("SELECT id FROM targets WHERE external_id = ?").get(a.id) as { id: string }).id;
+  const runId = (db.prepare("SELECT run_id FROM bridge_campaigns WHERE external_id='camp-erase'").get() as { run_id: string }).run_id;
+  db.prepare("INSERT INTO logs (id, run_id, target_id, level, message) VALUES ('lg1', ?, ?, 'info', 'Connected with Erase Me Person (erase.me@example.com)')").run(runId, tid);
+  db.prepare("INSERT INTO activity_logs (id, target_id, type, body) VALUES ('al1', ?, 'note', 'Spoke with Erase Me Person')").run(tid);
+  B.setCampaignStatus(db, "camp-erase", "start");
+  db.prepare("UPDATE targets SET connection_requested_at = datetime('now') WHERE id = ?").run(tid);
+  B.readEvents(db, null, 100); // capture an event for the person
+
+  const r = B.eraseLead(db, a.id);
+  assert.equal(r.erased, true);
+  // No table holds the person's name, email or id any more (looked for in every text column of every table).
+  const tables = (db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all() as { name: string }[]).map((t) => t.name);
+  for (const t of tables) {
+    const cols = (db.prepare(`PRAGMA table_info("${t}")`).all() as { name: string; type: string }[]).filter((c) => !/INT|REAL|NUM/i.test(c.type));
+    for (const c of cols) {
+      const hit = db.prepare(`SELECT COUNT(*) n FROM "${t}" WHERE CAST("${c.name}" AS TEXT) LIKE '%Erase Me%' OR CAST("${c.name}" AS TEXT) LIKE '%erase.me@%' OR CAST("${c.name}" AS TEXT) LIKE ?`).get(`%${a.id}%`) as { n: number };
+      assert.equal(hit.n, 0, `${t}.${c.name} still holds the erased person`);
+    }
+  }
+  assert.equal((db.prepare("PRAGMA foreign_key_check").all() as unknown[]).length, 0);
+  // The other person is untouched.
+  assert.equal((db.prepare("SELECT COUNT(*) c FROM targets WHERE external_id = ?").get(b.id) as any).c, 1);
+  // Repeating, or erasing someone unknown, is fine.
+  assert.equal(B.eraseLead(db, a.id).erased, false);
+  assert.equal(B.eraseLead(db, "no-such-person").erased, false);
+});
