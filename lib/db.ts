@@ -3,6 +3,7 @@ import path from "path";
 import { randomUUID } from "crypto";
 import { scheduleUpdateCheck } from "@/lib/update-check";
 import { encryptSecret, isEncrypted } from "@/lib/crypto";
+import { ensureBridgeSchema } from "@/lib/bridge";
 
 const DB_PATH = process.env.LINKI_DB_PATH || path.join(process.cwd(), "linki.db");
 
@@ -15,6 +16,7 @@ export function getDb(): Database.Database {
     db.pragma("foreign_keys = ON");
     initDb(db);
     runMigrations(db);
+    ensureBridgeSchema(db); // Careervira Console bridge tables (additive)
     scheduleUpdateCheck();
   }
   return db;

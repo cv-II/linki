@@ -1,0 +1,246 @@
+/**
+ * Careervira Console bridge.
+ *
+ * A small set of server-to-server routes (pages/api/bridge/[...path].ts) that let the Careervira Console
+ * drive Linki: enrol leads in a campaign, start / pause / stop it, take a lead out of every sequence, look a person up
+ * in Apollo, and read what happened (invites, acceptances, messages, replies, bounces) as an ordered event feed.
+ *
+ * Design rules:
+ *  - Nothing here changes how Linki sends. Sending is still done by the existing runner on the existing workflow.
+ *  - Everything is safe to repeat (enrolling, stopping, unenrolling, reading events).
+ *  - The Console's lead id is stored on the target as `external_id`. Events are reported with that id.
+ *  - Events are DERIVED from the timestamps the runner already writes on targets (connection_requested_at, connected_at,
+ *    message_sent_at, last_replied_at, email_replied_at, email_status) so the runner itself is not modified.
+ *
+ * Auth: the existing proxy already requires the x-internal-secret header (INTERNAL_API_SECRET) on every /api/* route.
+ * See docs/BRIDGE.md. Spec of what the Console expects: careervira-crm/linki-patches/PATCHSET_SPEC.md.
+ */
+import type Database from "better-sqlite3";
+import { randomUUID } from "crypto";
+
+type Db = Database.Database;
+
+export class BridgeError extends Error {
+  constructor(public status: number, public code: string, message: string) { super(message); }
+}
+
+export interface BridgeLead {
+  id: string; name?: string | null; title?: string | null; company?: string | null; email?: string | null;
+  linkedin_url?: string | null; country?: string | null; dnc?: boolean;
+}
+
+export function ensureBridgeSchema(db: Db): void {
+  try { db.exec("ALTER TABLE targets ADD COLUMN external_id TEXT"); } catch { /* already there */ }
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_targets_external_id ON targets(external_id) WHERE external_id IS NOT NULL;
+    CREATE TABLE IF NOT EXISTS bridge_campaigns (
+      external_id TEXT PRIMARY KEY,
+      name TEXT,
+      workflow_id TEXT NOT NULL,
+      run_id TEXT NOT NULL,
+      list_id TEXT NOT NULL,
+      account_id TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS bridge_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      type TEXT NOT NULL,
+      external_lead_id TEXT NOT NULL,
+      at TEXT NOT NULL,
+      UNIQUE(type, external_lead_id)
+    );
+  `);
+}
+
+const isoOf = (s: string | null | undefined): string => {
+  if (!s) return new Date().toISOString();
+  const t = s.includes("T") ? s : s.replace(" ", "T") + "Z";
+  const d = new Date(t);
+  return Number.isNaN(d.getTime()) ? new Date().toISOString() : d.toISOString();
+};
+
+export interface BridgeConfig { workflowId?: string; accountId?: string; emailAccountIds?: string[] }
+export const configFromEnv = (env: NodeJS.ProcessEnv = process.env): BridgeConfig => ({
+  workflowId: env.BRIDGE_WORKFLOW_ID || undefined,
+  accountId: env.BRIDGE_ACCOUNT_ID || undefined,
+  emailAccountIds: (env.BRIDGE_EMAIL_ACCOUNT_IDS ?? "").split(",").map((s) => s.trim()).filter(Boolean),
+});
+
+/** Finds (or lazily creates) the Linki run that stands for one Console campaign. */
+function campaignRow(db: Db, externalId: string, cfg: BridgeConfig, create: boolean, name?: string) {
+  const row = db.prepare("SELECT * FROM bridge_campaigns WHERE external_id = ?").get(externalId) as
+    { external_id: string; workflow_id: string; run_id: string; list_id: string; account_id: string } | undefined;
+  if (row || !create) return row;
+
+  let workflowId = cfg.workflowId;
+  if (!workflowId) {
+    const all = db.prepare("SELECT id FROM workflows WHERE COALESCE(is_archived,0) = 0").all() as { id: string }[];
+    if (all.length === 1) workflowId = all[0].id;
+  }
+  if (!workflowId) throw new BridgeError(409, "bridge_not_configured", "Set BRIDGE_WORKFLOW_ID to the Linki workflow (sequence) Console campaigns should use.");
+  if (!db.prepare("SELECT 1 FROM workflows WHERE id = ?").get(workflowId)) throw new BridgeError(409, "bridge_not_configured", "BRIDGE_WORKFLOW_ID does not match a workflow.");
+
+  let accountId = cfg.accountId;
+  if (!accountId) {
+    const acc = db.prepare("SELECT id FROM accounts WHERE is_authenticated = 1 ORDER BY created_at LIMIT 1").get() as { id: string } | undefined;
+    accountId = acc?.id;
+  }
+  if (!accountId) throw new BridgeError(409, "bridge_not_configured", "No signed-in LinkedIn account. Set BRIDGE_ACCOUNT_ID or sign an account in.");
+
+  const label = name?.trim() || `Console campaign ${externalId.slice(0, 8)}`;
+  const listId = randomUUID(); const runId = randomUUID();
+  db.transaction(() => {
+    db.prepare("INSERT INTO lists (id, name, description) VALUES (?, ?, ?)").run(listId, `Console: ${label}`, "Created by the Careervira Console bridge");
+    db.prepare("INSERT INTO runs (id, workflow_id, list_id, account_id, email_account_id, status) VALUES (?, ?, ?, ?, ?, 'paused')")
+      .run(runId, workflowId, listId, accountId, cfg.emailAccountIds?.[0] ?? null);
+    db.prepare("INSERT INTO bridge_campaigns (external_id, name, workflow_id, run_id, list_id, account_id) VALUES (?,?,?,?,?,?)")
+      .run(externalId, label, workflowId, runId, listId, accountId);
+  })();
+  return campaignRow(db, externalId, cfg, false);
+}
+
+function splitName(full: string): { first: string; last: string } {
+  const p = full.trim().split(/\s+/);
+  return { first: p[0] ?? "", last: p.slice(1).join(" ") };
+}
+
+/** Adds leads to the campaign's run. Returns counts. Leads marked Do-not-contact are never enrolled. */
+export function enrolLeads(db: Db, externalCampaignId: string, leads: BridgeLead[], cfg: BridgeConfig, name?: string) {
+  if (!Array.isArray(leads) || leads.length === 0) throw new BridgeError(400, "bad_request", "leads must be a non-empty list.");
+  if (leads.length > 500) throw new BridgeError(400, "too_many", "At most 500 leads per call.");
+  for (const l of leads) if (!l || typeof l.id !== "string" || !l.id) throw new BridgeError(400, "bad_request", "Every lead needs an id.");
+
+  const camp = campaignRow(db, externalCampaignId, cfg, true, name)!;
+  const tracks = [...new Set((db.prepare("SELECT DISTINCT track FROM workflow_steps WHERE workflow_id = ?").all(camp.workflow_id) as { track: string }[]).map((r) => r.track))];
+  if (tracks.length === 0) tracks.push("linkedin");
+  const runEmail = (db.prepare("SELECT email_account_id FROM runs WHERE id = ?").get(camp.run_id) as { email_account_id: string | null } | undefined)?.email_account_id;
+  const emailPool = [...new Set([...(cfg.emailAccountIds ?? []), ...(runEmail ? [runEmail] : [])])];
+
+  const out = { enrolled: 0, skipped: { do_not_contact: 0, already_enrolled: 0, active_elsewhere: 0 } as Record<string, number> };
+  let cursor = 0;
+  db.transaction(() => {
+    for (const l of leads) {
+      if (l.dnc) { out.skipped.do_not_contact++; continue; }
+      let t = db.prepare("SELECT id FROM targets WHERE external_id = ?").get(l.id) as { id: string } | undefined;
+      const url = l.linkedin_url && /linkedin\.com\/in\//i.test(l.linkedin_url) ? l.linkedin_url : null;
+      if (!t && url) t = db.prepare("SELECT id FROM targets WHERE linkedin_url = ?").get(url) as { id: string } | undefined;
+      if (!t && l.email) t = db.prepare("SELECT id FROM targets WHERE lower(email) = lower(?) AND external_id IS NULL").get(l.email) as { id: string } | undefined;
+      const nm = splitName(l.name ?? "");
+      if (!t) {
+        const id = randomUUID();
+        db.prepare("INSERT INTO targets (id, linkedin_url, first_name, last_name, full_name, title, company, email, external_id) VALUES (?,?,?,?,?,?,?,?,?)")
+          .run(id, url, nm.first, nm.last, l.name ?? null, l.title ?? null, l.company ?? null, l.email ?? null, l.id);
+        t = { id };
+      } else {
+        db.prepare("UPDATE targets SET external_id = COALESCE(external_id, ?), email = COALESCE(email, ?), linkedin_url = COALESCE(linkedin_url, ?) WHERE id = ?").run(l.id, l.email ?? null, url, t.id);
+      }
+      db.prepare("INSERT OR IGNORE INTO list_targets (list_id, target_id) VALUES (?, ?)").run(camp.list_id, t.id);
+
+      if (db.prepare(`SELECT 1 FROM run_profiles rp JOIN runs r ON r.id = rp.run_id WHERE r.workflow_id = ? AND rp.target_id = ?`).get(camp.workflow_id, t.id)) { out.skipped.already_enrolled++; continue; }
+      if (db.prepare(`SELECT 1 FROM run_profiles rp JOIN runs r ON r.id = rp.run_id
+                      WHERE r.status IN ('running','paused') AND rp.target_id = ? AND r.id <> ?
+                      AND EXISTS (SELECT 1 FROM run_profile_tracks rt WHERE rt.run_profile_id = rp.id AND rt.state NOT IN ('completed','failed','skipped'))`).get(t.id, camp.run_id)) { out.skipped.active_elsewhere++; continue; }
+
+      const emailAccount = emailPool.length ? emailPool[cursor++ % emailPool.length] : null;
+      const rpId = randomUUID();
+      db.prepare("INSERT INTO run_profiles (id, run_id, target_id, email_account_id) VALUES (?,?,?,?)").run(rpId, camp.run_id, t.id, emailAccount);
+      for (const track of tracks) {
+        if (track === "email" && !emailAccount) continue;
+        db.prepare("INSERT INTO run_profile_tracks (id, run_profile_id, track, state, current_step) VALUES (?,?,?,'pending',0)").run(randomUUID(), rpId, track);
+      }
+      out.enrolled++;
+    }
+  })();
+  return out;
+}
+
+export function setCampaignStatus(db: Db, externalCampaignId: string, action: "start" | "pause" | "stop") {
+  const camp = campaignRow(db, externalCampaignId, {}, false);
+  if (!camp) throw new BridgeError(404, "campaign_not_found", "Linki has not seen this campaign yet. Enrol leads first.");
+  const run = db.prepare("SELECT status FROM runs WHERE id = ?").get(camp.run_id) as { status: string };
+  if (action === "start") {
+    if (run.status === "completed") throw new BridgeError(409, "campaign_stopped", "This campaign was stopped and cannot be started again.");
+    db.prepare("UPDATE runs SET status = 'running', started_at = COALESCE(started_at, datetime('now')) WHERE id = ?").run(camp.run_id);
+    return { status: "running" };
+  }
+  if (action === "pause") {
+    if (run.status === "running") db.prepare("UPDATE runs SET status = 'paused' WHERE id = ?").run(camp.run_id);
+    return { status: run.status === "completed" ? "completed" : "paused" };
+  }
+  // stop
+  if (run.status !== "completed") {
+    db.transaction(() => {
+      db.prepare(`UPDATE run_profile_tracks SET state = 'skipped', error_message = 'Campaign stopped from the Console'
+                  WHERE state IN ('pending','in_progress') AND run_profile_id IN (SELECT id FROM run_profiles WHERE run_id = ?)`).run(camp.run_id);
+      db.prepare("UPDATE runs SET status = 'completed', completed_at = datetime('now') WHERE id = ?").run(camp.run_id);
+    })();
+  }
+  return { status: "completed" };
+}
+
+/** Takes one lead out of every sequence. Unknown leads are fine (already gone). */
+export function unenrolLead(db: Db, externalLeadId: string) {
+  const t = db.prepare("SELECT id FROM targets WHERE external_id = ?").get(externalLeadId) as { id: string } | undefined;
+  if (!t) return { unenrolled: 0 };
+  const r = db.prepare(`UPDATE run_profile_tracks SET state = 'skipped', error_message = 'Removed from the sequence by the Console'
+                        WHERE state IN ('pending','in_progress') AND run_profile_id IN (SELECT id FROM run_profiles WHERE target_id = ?)`).run(t.id);
+  return { unenrolled: r.changes };
+}
+
+/** Copies new facts from the targets table into the ordered event list. Safe to run any number of times. */
+export function captureEvents(db: Db): number {
+  const before = (db.prepare("SELECT COALESCE(MAX(id),0) AS m FROM bridge_events").get() as { m: number }).m;
+  const ins = (type: string, col: string, where = `t.${col} IS NOT NULL`, atExpr = `t.${col}`) =>
+    db.prepare(`INSERT OR IGNORE INTO bridge_events (type, external_lead_id, at)
+                SELECT '${type}', t.external_id, ${atExpr} FROM targets t WHERE t.external_id IS NOT NULL AND ${where} ORDER BY ${atExpr}, t.id`).run();
+  db.transaction(() => {
+    ins("invite_sent", "connection_requested_at");
+    ins("invite_accepted", "connected_at");
+    ins("message_sent", "message_sent_at");
+    ins("linkedin_reply", "last_replied_at");
+    ins("email_reply", "email_replied_at");
+    ins("email_bounced", "email_status", `t.email_status = 'invalid'`, `datetime('now')`);
+    db.prepare(`INSERT OR IGNORE INTO bridge_events (type, external_lead_id, at)
+                SELECT 'email_sent', t.external_id, COALESCE(MIN(rt.last_step_at), datetime('now'))
+                FROM targets t JOIN run_profiles rp ON rp.target_id = t.id JOIN run_profile_tracks rt ON rt.run_profile_id = rp.id
+                WHERE t.external_id IS NOT NULL AND rt.track = 'email' AND rt.last_email_subject IS NOT NULL GROUP BY t.external_id`).run();
+  })();
+  return (db.prepare("SELECT COALESCE(MAX(id),0) AS m FROM bridge_events").get() as { m: number }).m - before;
+}
+
+export function readEvents(db: Db, after: string | null, limit: number) {
+  const lim = Math.max(1, Math.min(1000, Math.floor(limit) || 200));
+  const cursor = after && /^\d+$/.test(after) ? Number(after) : 0;
+  captureEvents(db);
+  const rows = db.prepare("SELECT id, type, external_lead_id, at FROM bridge_events WHERE id > ? ORDER BY id LIMIT ?").all(cursor, lim) as
+    { id: number; type: string; external_lead_id: string; at: string }[];
+  return {
+    events: rows.map((r) => ({ id: String(r.id), type: r.type, lead_id: r.external_lead_id, at: isoOf(r.at) })),
+    next: rows.length ? String(rows[rows.length - 1].id) : (after ?? null),
+  };
+}
+
+// ---- Apollo lookup -------------------------------------------------------------------------------------------
+
+export interface EnrichInput { id?: string; name?: string; company?: string | null; linkedin_url?: string | null }
+export type EnrichOutput = { status: "matched"; email: string; title: string | null; country: string | null } | { status: "not_found" } | { status: "failed"; message: string };
+
+/** Looks one person up. Throws BridgeError with code key_missing / key_rejected / rate_limited / apollo_down when the whole batch should stop. */
+export async function apolloLookup(apiKey: string | null, input: EnrichInput, fetchImpl: typeof fetch = fetch, base = process.env.BRIDGE_APOLLO_BASE || "https://api.apollo.io/api/v1"): Promise<EnrichOutput> {
+  if (!apiKey) throw new BridgeError(409, "key_missing", "No Apollo key is saved in Linki (Settings, Integrations).");
+  const body: Record<string, unknown> = { reveal_personal_emails: false };
+  if (input.linkedin_url && /linkedin\.com\/in\//i.test(input.linkedin_url)) body.linkedin_url = input.linkedin_url;
+  else if (input.name) { body.name = input.name; if (input.company) body.organization_name = input.company; }
+  else return { status: "failed", message: "Needs a LinkedIn address or a name" };
+  let res: Response;
+  try { res = await fetchImpl(`${base}/people/match`, { method: "POST", headers: { "Content-Type": "application/json", "X-Api-Key": apiKey }, body: JSON.stringify(body), signal: AbortSignal.timeout(15000) }); }
+  catch (e) { throw new BridgeError(502, "apollo_down", `Apollo could not be reached: ${(e as Error).message}`); }
+  if (res.status === 401 || res.status === 403) throw new BridgeError(401, "key_rejected", "Apollo refused the saved key.");
+  if (res.status === 429) throw new BridgeError(429, "rate_limited", "Apollo rate limit reached. Try again later.");
+  if (res.status >= 500) throw new BridgeError(502, "apollo_down", `Apollo answered ${res.status}.`);
+  if (!res.ok) return { status: "failed", message: `Apollo answered ${res.status}` };
+  const data = (await res.json().catch(() => null)) as { person?: { id?: string; email?: string | null; title?: string | null; country?: string | null } } | null;
+  const p = data?.person;
+  if (!p?.id || !p.email) return { status: "not_found" };
+  return { status: "matched", email: String(p.email), title: p.title ?? null, country: p.country ?? null };
+}
