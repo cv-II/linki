@@ -42,6 +42,13 @@ export function ensureBridgeSchema(db: Db): void {
       account_id TEXT NOT NULL,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+    CREATE TABLE IF NOT EXISTS bridge_accounts (
+      account_id TEXT PRIMARY KEY,
+      ceiling_connection INTEGER NOT NULL,
+      ceiling_message INTEGER NOT NULL,
+      applied_connection INTEGER,
+      applied_message INTEGER
+    );
     CREATE TABLE IF NOT EXISTS bridge_events (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       type TEXT NOT NULL,
@@ -50,6 +57,9 @@ export function ensureBridgeSchema(db: Db): void {
       UNIQUE(type, external_lead_id)
     );
   `);
+  // Older databases made bridge_campaigns before the limit columns existed.
+  try { db.exec("ALTER TABLE bridge_campaigns ADD COLUMN daily_invites INTEGER"); } catch { /* already there */ }
+  try { db.exec("ALTER TABLE bridge_campaigns ADD COLUMN daily_messages INTEGER"); } catch { /* already there */ }
 }
 
 const isoOf = (s: string | null | undefined): string => {
@@ -105,12 +115,14 @@ function splitName(full: string): { first: string; last: string } {
 }
 
 /** Adds leads to the campaign's run. Returns counts. Leads marked Do-not-contact are never enrolled. */
-export function enrolLeads(db: Db, externalCampaignId: string, leads: BridgeLead[], cfg: BridgeConfig, name?: string) {
+export function enrolLeads(db: Db, externalCampaignId: string, leads: BridgeLead[], cfg: BridgeConfig, meta?: CampaignMeta | string) {
+  const name = typeof meta === "string" ? meta : meta?.name;
   if (!Array.isArray(leads) || leads.length === 0) throw new BridgeError(400, "bad_request", "leads must be a non-empty list.");
   if (leads.length > 500) throw new BridgeError(400, "too_many", "At most 500 leads per call.");
   for (const l of leads) if (!l || typeof l.id !== "string" || !l.id) throw new BridgeError(400, "bad_request", "Every lead needs an id.");
 
   const camp = campaignRow(db, externalCampaignId, cfg, true, name)!;
+  if (typeof meta === "object") saveCampaignLimits(db, externalCampaignId, meta);
   const tracks = [...new Set((db.prepare("SELECT DISTINCT track FROM workflow_steps WHERE workflow_id = ?").all(camp.workflow_id) as { track: string }[]).map((r) => r.track))];
   if (tracks.length === 0) tracks.push("linkedin");
   const runEmail = (db.prepare("SELECT email_account_id FROM runs WHERE id = ?").get(camp.run_id) as { email_account_id: string | null } | undefined)?.email_account_id;
@@ -154,9 +166,61 @@ export function enrolLeads(db: Db, externalCampaignId: string, leads: BridgeLead
   return out;
 }
 
-export function setCampaignStatus(db: Db, externalCampaignId: string, action: "start" | "pause" | "stop") {
+export interface CampaignMeta { name?: string; daily_invites?: number; daily_messages?: number }
+const validLimit = (n: unknown, max: number): number | null => (typeof n === "number" && Number.isInteger(n) && n >= 0 && n <= max ? n : null);
+
+/** Remember the Console campaign's own daily limits (invites 0-100, messages 0-200). Bad values are ignored, never guessed. */
+export function saveCampaignLimits(db: Db, externalId: string, meta?: CampaignMeta) {
+  if (!meta) return;
+  const inv = validLimit(meta.daily_invites, 100); const msg = validLimit(meta.daily_messages, 200);
+  if (inv === null && msg === null) return;
+  db.prepare("UPDATE bridge_campaigns SET daily_invites = COALESCE(?, daily_invites), daily_messages = COALESCE(?, daily_messages) WHERE external_id = ?").run(inv, msg, externalId);
+}
+
+/**
+ * Linki limits sending per LinkedIn account, not per campaign. So the account's daily limits are set to
+ * the SUM of the limits of the Console campaigns running on it, but never above the ceiling the tech team set in Linki.
+ * The ceiling is the account's own value the first time we touch it (and again whenever someone changes it in Linki).
+ * When no Console campaign is running the account goes back to its ceiling, so other Linki use is unaffected.
+ */
+export function applyAccountLimits(db: Db, accountId: string) {
+  const acc = db.prepare("SELECT daily_connection_limit AS c, daily_message_limit AS m FROM accounts WHERE id = ?").get(accountId) as { c: number | null; m: number | null } | undefined;
+  if (!acc) return;
+  let st = db.prepare("SELECT * FROM bridge_accounts WHERE account_id = ?").get(accountId) as
+    { ceiling_connection: number; ceiling_message: number; applied_connection: number | null; applied_message: number | null } | undefined;
+  const curC = acc.c ?? 20; const curM = acc.m ?? 50;
+  if (!st) {
+    db.prepare("INSERT INTO bridge_accounts (account_id, ceiling_connection, ceiling_message) VALUES (?,?,?)").run(accountId, curC, curM);
+    st = { ceiling_connection: curC, ceiling_message: curM, applied_connection: null, applied_message: null };
+  } else {
+    // If someone edited the limit in Linki since we last set it, that new value is the new ceiling.
+    if (st.applied_connection !== null && curC !== st.applied_connection) st.ceiling_connection = curC;
+    if (st.applied_message !== null && curM !== st.applied_message) st.ceiling_message = curM;
+  }
+  const run = db.prepare(`SELECT COALESCE(SUM(b.daily_invites),0) AS inv, COALESCE(SUM(b.daily_messages),0) AS msg,
+                                 SUM(b.daily_invites IS NOT NULL) AS hasInv, SUM(b.daily_messages IS NOT NULL) AS hasMsg, COUNT(*) AS n
+                          FROM bridge_campaigns b JOIN runs r ON r.id = b.run_id WHERE b.account_id = ? AND r.status = 'running'`).get(accountId) as
+    { inv: number; msg: number; hasInv: number | null; hasMsg: number | null; n: number };
+  // A running campaign that never told us its limits does not lower anything (the ceiling still protects the account).
+  const allInv = run.n > 0 && run.hasInv === run.n; const allMsg = run.n > 0 && run.hasMsg === run.n;
+  const newC = allInv ? Math.min(st.ceiling_connection, run.inv) : st.ceiling_connection;
+  const newM = allMsg ? Math.min(st.ceiling_message, run.msg) : st.ceiling_message;
+  db.prepare("UPDATE accounts SET daily_connection_limit = ?, daily_message_limit = ? WHERE id = ?").run(newC, newM, accountId);
+  db.prepare("UPDATE bridge_accounts SET ceiling_connection=?, ceiling_message=?, applied_connection=?, applied_message=? WHERE account_id = ?")
+    .run(st.ceiling_connection, st.ceiling_message, newC, newM, accountId);
+}
+
+export function setCampaignStatus(db: Db, externalCampaignId: string, action: "start" | "pause" | "stop", meta?: CampaignMeta) {
+  const out = setCampaignStatusInner(db, externalCampaignId, action, meta);
+  const camp = campaignRow(db, externalCampaignId, {}, false);
+  if (camp) applyAccountLimits(db, camp.account_id);
+  return out;
+}
+
+function setCampaignStatusInner(db: Db, externalCampaignId: string, action: "start" | "pause" | "stop", meta?: CampaignMeta) {
   const camp = campaignRow(db, externalCampaignId, {}, false);
   if (!camp) throw new BridgeError(404, "campaign_not_found", "Linki has not seen this campaign yet. Enrol leads first.");
+  if (action === "start") saveCampaignLimits(db, externalCampaignId, meta);
   const run = db.prepare("SELECT status FROM runs WHERE id = ?").get(camp.run_id) as { status: string };
   if (action === "start") {
     if (run.status === "completed") throw new BridgeError(409, "campaign_stopped", "This campaign was stopped and cannot be started again.");

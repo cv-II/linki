@@ -18,7 +18,7 @@ In the Console set `LINKI_URL=http://<linki>:3000` and `LINKI_INTERNAL_SECRET` t
 | Route | Does |
 |---|---|
 | `POST campaigns/:id/members` `{leads:[{id,name,title,company,email,linkedin_url,dnc}]}` | Creates the Linki list and run on first use, adds people, enrols them. Skips Do-not-contact, people already in this workflow and people active in another running campaign. Repeat is safe. |
-| `POST campaigns/:id/start`, `pause`, `stop` | Runs the sequence, pauses it, or ends it (waiting leads are skipped; stop cannot be undone). |
+| `POST campaigns/:id/start` `{campaign:{name,daily_invites,daily_messages}}`, `pause`, `stop` | Runs the sequence, pauses it, or ends it (waiting leads are skipped; stop cannot be undone). |
 | `DELETE leads/:id` | Skips the person's waiting steps everywhere. Unknown person is fine. |
 | `POST enrich` `{id,name,company,linkedin_url}` | Apollo lookup. Errors carry `key_missing`, `key_rejected`, `rate_limited` or `apollo_down`. |
 | `GET events?after=&limit=` | `{events:[{id,type,lead_id,at}], next}`. Types: invite_sent, invite_accepted, message_sent, linkedin_reply, email_sent, email_reply, email_bounced. |
@@ -26,8 +26,11 @@ In the Console set `LINKI_URL=http://<linki>:3000` and `LINKI_INTERNAL_SECRET` t
 
 Events are derived from timestamps the runner already writes on `targets`, so the runner is untouched.
 
+## Daily limits
+Linki limits sending per LinkedIn account, not per campaign. The Console sends each campaign's `daily_invites` (0-100) and `daily_messages` (0-200) with enrol and start. While Console campaigns run on an account, that account's daily connection and message limits are set to the **total** of their limits, but never above the account's ceiling. The ceiling is the account's own value the first time the bridge touches it, and changes if someone edits the limit in Linki afterwards. When no Console campaign runs, the account returns to its ceiling. Bad values are ignored. Tables: `bridge_accounts`, columns `bridge_campaigns.daily_invites/daily_messages`.
+
 ## Tests
-`npx tsx --test tests/bridge.test.ts` (throwaway database).
+`npx tsx --test tests/bridge.test.ts tests/bridge-limits.test.ts` (throwaway databases).
 
 ## Not verified
 Real LinkedIn sending, real email, real Apollo answers. Everything was exercised against a test database only.

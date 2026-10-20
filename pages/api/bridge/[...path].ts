@@ -1,7 +1,7 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 import { getDb } from "@/lib/db";
 import { decryptSecret } from "@/lib/crypto";
-import { apolloLookup, BridgeError, configFromEnv, enrolLeads, readEvents, setCampaignStatus, unenrolLead } from "@/lib/bridge";
+import { apolloLookup, BridgeError, configFromEnv, applyAccountLimits, enrolLeads, readEvents, setCampaignStatus, unenrolLead } from "@/lib/bridge";
 
 /**
  * Careervira Console bridge. One catch-all route so the whole contract is in one place.
@@ -21,10 +21,13 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     switch (key) {
       case "POST campaigns/:id/members": {
         const b = req.body ?? {};
-        return res.json(enrolLeads(db, parts[1], b.leads, configFromEnv(), b.campaign?.name));
+        const out = enrolLeads(db, parts[1], b.leads, configFromEnv(), b.campaign ?? undefined);
+        const c = db.prepare("SELECT account_id FROM bridge_campaigns WHERE external_id = ?").get(parts[1]) as { account_id: string } | undefined;
+        if (c) applyAccountLimits(db, c.account_id);
+        return res.json(out);
       }
       case "POST campaigns/:id/start": {
-        const out = setCampaignStatus(db, parts[1], "start");
+        const out = setCampaignStatus(db, parts[1], "start", req.body?.campaign ?? undefined);
         const { ensureGlobalRunnerStarted } = await import("@/lib/linkedin/runner");
         ensureGlobalRunnerStarted();
         return res.json(out);
