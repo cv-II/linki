@@ -10,6 +10,7 @@ import { shouldSyncEmailInbox, syncEmailInbox } from "@/lib/email/inbox";
 import { enrichProfile } from "@/lib/linkedin/enrich";
 import { matchPerson } from "@/lib/apollo";
 import { premium } from "@/lib/premium";
+import { inboxReplies } from "@/lib/linkedin/reply-sync";
 import { decryptSecret } from "@/lib/crypto";
 
 // Minimum gap between Sales Nav profile enrichment calls per account (ms)
@@ -1009,12 +1010,12 @@ async function tick(db: ReturnType<typeof getDb>): Promise<void> {
 
   // LinkedIn inbox reply detection (messaging GraphQL) — once per 15min per
   // account. Sets targets.last_replied_at so the runner auto-unenrolls repliers.
-  // LinkedIn reply detection is a premium feature (AI classifier layer) — no-op without ee/.
+  // The paid build's reader is used when ee/ is present; otherwise our own read-only reader (reply-sync.ts, X11).
   for (const accountId of seenAccounts) {
-    if (premium?.replies?.shouldSyncInbox(accountId)) {
+    if (inboxReplies.shouldSyncInbox(accountId)) {
       try {
         console.log(`[runner] Starting LinkedIn inbox sync for account ${accountId}`);
-        const replies = await premium.replies.syncAccountInbox(accountId);
+        const replies = await inboxReplies.syncAccountInbox(accountId);
         console.log(`[runner] LinkedIn inbox sync complete — ${replies} new repl${replies === 1 ? "y" : "ies"}`);
         if (replies > 0) {
           for (const r of activeRuns.filter(x => x.account_id === accountId)) {

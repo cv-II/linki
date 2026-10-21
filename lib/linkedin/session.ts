@@ -24,8 +24,29 @@ const LAUNCH_ARGS = [
  * options so the LinkedIn session is BORN under the exact fingerprint it will
  * later be used with — a mismatch (or a drift) triggers a forced re-auth.
  */
-function contextOptions(storageState?: object) {
+/**
+ * Optional per-account proxy (X12). Only used when LINKI_PER_CONTEXT_PROXY=1 and the account has a proxy_url.
+ * UNVERIFIED against a real proxy: test it with one pilot account before relying on it.
+ */
+export function proxyForAccount(accountId?: string): { server: string; username?: string; password?: string } | undefined {
+  if (!accountId || process.env.LINKI_PER_CONTEXT_PROXY !== "1") return undefined;
+  try {
+    const row = getDb().prepare("SELECT proxy_url FROM accounts WHERE id = ?").get(accountId) as { proxy_url: string | null } | undefined;
+    const raw = row?.proxy_url ? decryptSecret(row.proxy_url) : null;
+    if (!raw) return undefined;
+    const u = new URL(raw);
+    return {
+      server: `${u.protocol}//${u.host}`,
+      username: u.username ? decodeURIComponent(u.username) : undefined,
+      password: u.password ? decodeURIComponent(u.password) : undefined,
+    };
+  } catch { return undefined; }
+}
+
+function contextOptions(storageState?: object, accountId?: string) {
+  const proxy = proxyForAccount(accountId);
   return {
+    ...(proxy ? { proxy } : {}),
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     storageState: storageState as any,
     viewport: { width: 1920, height: 1080 },
@@ -50,6 +71,7 @@ async function getBrowser(headless = HEADLESS): Promise<Browser> {
       headless,
       executablePath: CHROMIUM_PATH,
       args: LAUNCH_ARGS,
+      ...(process.env.LINKI_PER_CONTEXT_PROXY === "1" ? { proxy: { server: "per-context" } } : {}),
     });
   }
   return browser;
@@ -75,7 +97,7 @@ async function getOrCreateContext(accountId: string): Promise<BrowserContext> {
       }
     }
 
-    const ctx = await b.newContext(contextOptions(storageState));
+    const ctx = await b.newContext(contextOptions(storageState, accountId));
 
     // Auto-evict from map when context closes for any reason (crash, session expiry, etc.)
     ctx.on("close", () => { if (contexts.get(accountId) === ctx) contexts.delete(accountId); });
@@ -399,7 +421,7 @@ export async function startHeadlessLogin(
   await clearPendingLogin(accountId);
 
   const b = await getBrowser(true);
-  const ctx = await b.newContext(contextOptions());
+  const ctx = await b.newContext(contextOptions(undefined, accountId));
   const page = await ctx.newPage();
   try {
     await page.goto("https://www.linkedin.com/login", { waitUntil: "domcontentloaded", timeout: 30_000 });

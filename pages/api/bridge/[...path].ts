@@ -1,6 +1,7 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 import { getDb } from "@/lib/db";
 import { decryptSecret } from "@/lib/crypto";
+import { disconnectAccount, linkWithCookie, listAccounts, loginAwait, loginStart, loginVerify, setAccountProxy } from "@/lib/bridge-accounts";
 import { apolloLookup, BridgeError, configFromEnv, applyAccountLimits, enrolLeads, eraseLead, readEvents, setCampaignStatus, unenrolLead } from "@/lib/bridge";
 
 /**
@@ -10,20 +11,34 @@ import { apolloLookup, BridgeError, configFromEnv, applyAccountLimits, enrolLead
  *   DELETE /api/bridge/leads/:id
  *   POST   /api/bridge/enrich                  { id, name, company, linkedin_url }
  *   GET    /api/bridge/events?after=&limit=
+ *   GET    /api/bridge/accounts   POST accounts/login/start|verify|await, POST accounts/cookies, DELETE accounts/:id, PUT accounts/:id/proxy
  *   POST   /api/bridge/invites/withdraw        (not implemented yet: answers 501)
  * Auth is the existing x-internal-secret check in proxy.ts.
  */
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   const parts = ([] as string[]).concat(req.query.path ?? []);
-  const key = `${req.method} ${parts.length === 3 && parts[0] === "campaigns" ? `campaigns/:id/${parts[2]}` : parts.length === 2 && parts[0] === "leads" ? "leads/:id" : parts.length === 3 && parts[0] === "leads" && parts[2] === "erase" ? "leads/:id/erase" : parts.join("/")}`;
+  const routeOf = (): string => {
+    if (parts[0] === "campaigns" && parts.length === 3) return `campaigns/:id/${parts[2]}`;
+    if (parts[0] === "leads" && parts.length === 2) return "leads/:id";
+    if (parts[0] === "leads" && parts.length === 3 && parts[2] === "erase") return "leads/:id/erase";
+    if (parts[0] === "accounts" && parts.length === 2 && parts[1] !== "cookies") return "accounts/:id";
+    if (parts[0] === "accounts" && parts.length === 3 && parts[2] === "proxy") return "accounts/:id/proxy";
+    return parts.join("/");
+  };
+  const key = `${req.method} ${routeOf()}`;
   try {
     const db = getDb();
     switch (key) {
       case "POST campaigns/:id/members": {
         const b = req.body ?? {};
-        const out = enrolLeads(db, parts[1], b.leads, configFromEnv(), b.campaign ?? undefined);
-        const c = db.prepare("SELECT account_id FROM bridge_campaigns WHERE external_id = ?").get(parts[1]) as { account_id: string } | undefined;
-        if (c) applyAccountLimits(db, c.account_id);
+        const cfg = configFromEnv();
+        if (typeof b.account_id === "string" && b.account_id) { cfg.accountId = b.account_id; cfg.explicitAccount = true; }
+        const out = enrolLeads(db, parts[1], b.leads, cfg, b.campaign ?? undefined);
+        if (cfg.accountId) applyAccountLimits(db, cfg.accountId);
+        else {
+          const c = db.prepare("SELECT account_id FROM bridge_campaigns WHERE external_id = ?").get(parts[1]) as { account_id: string } | undefined;
+          if (c) applyAccountLimits(db, c.account_id);
+        }
         return res.json(out);
       }
       case "POST campaigns/:id/start": {
@@ -44,6 +59,13 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         const row = db.prepare("SELECT api_key FROM integrations WHERE key = 'apollo'").get() as { api_key: string } | undefined;
         return res.json(await apolloLookup(row ? decryptSecret(row.api_key) : null, req.body ?? {}));
       }
+      case "GET accounts": return res.json(listAccounts(db));
+      case "POST accounts/login/start": return res.json(await loginStart(db, req.body ?? {}));
+      case "POST accounts/login/verify": return res.json(await loginVerify(db, req.body ?? {}));
+      case "POST accounts/login/await": return res.json(await loginAwait(db, req.body ?? {}));
+      case "POST accounts/cookies": return res.json(await linkWithCookie(db, req.body ?? {}));
+      case "DELETE accounts/:id": return res.json(await disconnectAccount(db, parts[1]));
+      case "PUT accounts/:id/proxy": return res.json(setAccountProxy(db, parts[1], typeof req.body?.proxy_url === "string" ? req.body.proxy_url : null));
       case "POST invites/withdraw":
         return res.status(501).json({ error: { code: "not_implemented", message: "Withdrawing LinkedIn invitations is not built into Linki yet." } });
       default:

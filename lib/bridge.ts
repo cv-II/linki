@@ -60,7 +60,35 @@ export function ensureBridgeSchema(db: Db): void {
   // Older databases made bridge_campaigns before the limit columns existed.
   try { db.exec("ALTER TABLE bridge_campaigns ADD COLUMN daily_invites INTEGER"); } catch { /* already there */ }
   try { db.exec("ALTER TABLE bridge_campaigns ADD COLUMN daily_messages INTEGER"); } catch { /* already there */ }
+  // X12: one campaign can run through several LinkedIn accounts (one run per account).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS bridge_campaign_runs (
+      external_id TEXT NOT NULL,
+      account_id TEXT NOT NULL,
+      run_id TEXT NOT NULL,
+      list_id TEXT NOT NULL,
+      workflow_id TEXT NOT NULL,
+      PRIMARY KEY (external_id, account_id)
+    );
+  `);
+  try { db.exec("ALTER TABLE bridge_events ADD COLUMN account_id TEXT"); } catch { /* already there */ }
+  try { db.exec("ALTER TABLE accounts ADD COLUMN console_user_id TEXT"); } catch { /* already there */ }
+  try { db.exec("ALTER TABLE accounts ADD COLUMN proxy_url TEXT"); } catch { /* already there */ }
+  db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_console_user ON accounts(console_user_id) WHERE console_user_id IS NOT NULL");
+  backfillRuns(db);
 }
+
+/** Every first run of a campaign (bridge_campaigns) is also listed in bridge_campaign_runs. Safe to repeat. */
+function backfillRuns(db: Db): void {
+  db.exec(`INSERT OR IGNORE INTO bridge_campaign_runs (external_id, account_id, run_id, list_id, workflow_id)
+           SELECT external_id, account_id, run_id, list_id, workflow_id FROM bridge_campaigns`);
+}
+
+interface CampRun { external_id: string; workflow_id: string; run_id: string; list_id: string; account_id: string }
+const runsOf = (db: Db, externalId: string): CampRun[] => {
+  backfillRuns(db);
+  return db.prepare("SELECT external_id, workflow_id, run_id, list_id, account_id FROM bridge_campaign_runs WHERE external_id = ? ORDER BY rowid").all(externalId) as CampRun[];
+};
 
 const isoOf = (s: string | null | undefined): string => {
   if (!s) return new Date().toISOString();
@@ -69,20 +97,28 @@ const isoOf = (s: string | null | undefined): string => {
   return Number.isNaN(d.getTime()) ? new Date().toISOString() : d.toISOString();
 };
 
-export interface BridgeConfig { workflowId?: string; accountId?: string; emailAccountIds?: string[] }
+export interface BridgeConfig { workflowId?: string; accountId?: string; explicitAccount?: boolean; emailAccountIds?: string[] }
 export const configFromEnv = (env: NodeJS.ProcessEnv = process.env): BridgeConfig => ({
   workflowId: env.BRIDGE_WORKFLOW_ID || undefined,
   accountId: env.BRIDGE_ACCOUNT_ID || undefined,
   emailAccountIds: (env.BRIDGE_EMAIL_ACCOUNT_IDS ?? "").split(",").map((s) => s.trim()).filter(Boolean),
 });
 
-/** Finds (or lazily creates) the Linki run that stands for one Console campaign. */
-function campaignRow(db: Db, externalId: string, cfg: BridgeConfig, create: boolean, name?: string) {
-  const row = db.prepare("SELECT * FROM bridge_campaigns WHERE external_id = ?").get(externalId) as
-    { external_id: string; workflow_id: string; run_id: string; list_id: string; account_id: string } | undefined;
-  if (row || !create) return row;
+/**
+ * Finds (or lazily creates) the Linki run that stands for one Console campaign.
+ * With cfg.accountId set explicitly (a rep's own account) the run for THAT account is used, so one campaign can
+ * run through several accounts. Without it the campaign's first run is used (single-account behaviour).
+ */
+function campaignRow(db: Db, externalId: string, cfg: BridgeConfig, create: boolean, name?: string): CampRun | undefined {
+  const existing = runsOf(db, externalId);
+  if (cfg.accountId && cfg.explicitAccount) {
+    const mine = existing.find((r) => r.account_id === cfg.accountId);
+    if (mine || !create) return mine;
+  } else if (existing.length || !create) {
+    return existing[0];
+  }
 
-  let workflowId = cfg.workflowId;
+  let workflowId = cfg.workflowId ?? existing[0]?.workflow_id;
   if (!workflowId) {
     const all = db.prepare("SELECT id FROM workflows WHERE COALESCE(is_archived,0) = 0").all() as { id: string }[];
     if (all.length === 1) workflowId = all[0].id;
@@ -91,20 +127,30 @@ function campaignRow(db: Db, externalId: string, cfg: BridgeConfig, create: bool
   if (!db.prepare("SELECT 1 FROM workflows WHERE id = ?").get(workflowId)) throw new BridgeError(409, "bridge_not_configured", "BRIDGE_WORKFLOW_ID does not match a workflow.");
 
   let accountId = cfg.accountId;
-  if (!accountId) {
+  if (cfg.explicitAccount) {
+    const a = accountId ? db.prepare("SELECT is_authenticated FROM accounts WHERE id = ?").get(accountId) as { is_authenticated: number } | undefined : undefined;
+    if (!a || !a.is_authenticated) throw new BridgeError(409, "account_not_connected", "That LinkedIn account is not connected (or needs to be signed in again).");
+  } else if (!accountId) {
     const acc = db.prepare("SELECT id FROM accounts WHERE is_authenticated = 1 ORDER BY created_at LIMIT 1").get() as { id: string } | undefined;
     accountId = acc?.id;
   }
   if (!accountId) throw new BridgeError(409, "bridge_not_configured", "No signed-in LinkedIn account. Set BRIDGE_ACCOUNT_ID or sign an account in.");
 
-  const label = name?.trim() || `Console campaign ${externalId.slice(0, 8)}`;
+  const label = name?.trim() || existing[0] && (db.prepare("SELECT name FROM bridge_campaigns WHERE external_id = ?").get(externalId) as { name: string } | undefined)?.name || `Console campaign ${externalId.slice(0, 8)}`;
   const listId = randomUUID(); const runId = randomUUID();
   db.transaction(() => {
-    db.prepare("INSERT INTO lists (id, name, description) VALUES (?, ?, ?)").run(listId, `Console: ${label}`, "Created by the Careervira Console bridge");
-    db.prepare("INSERT INTO runs (id, workflow_id, list_id, account_id, email_account_id, status) VALUES (?, ?, ?, ?, ?, 'paused')")
-      .run(runId, workflowId, listId, accountId, cfg.emailAccountIds?.[0] ?? null);
-    db.prepare("INSERT INTO bridge_campaigns (external_id, name, workflow_id, run_id, list_id, account_id) VALUES (?,?,?,?,?,?)")
-      .run(externalId, label, workflowId, runId, listId, accountId);
+    db.prepare("INSERT INTO lists (id, name, description) VALUES (?, ?, ?)").run(listId, `Console: ${label}${existing.length ? ` (${accountId!.slice(0, 6)})` : ""}`, "Created by the Careervira Console bridge");
+    // A campaign added to a new account starts in the same state the campaign is in: paused unless its other runs are running.
+    const startRunning = existing.some((e) => (db.prepare("SELECT status FROM runs WHERE id = ?").get(e.run_id) as { status: string } | undefined)?.status === "running");
+    db.prepare("INSERT INTO runs (id, workflow_id, list_id, account_id, email_account_id, status) VALUES (?, ?, ?, ?, ?, ?)")
+      .run(runId, workflowId, listId, accountId, cfg.emailAccountIds?.[0] ?? null, startRunning ? "running" : "paused");
+    if (startRunning) db.prepare("UPDATE runs SET started_at = datetime('now') WHERE id = ?").run(runId);
+    if (!existing.length) {
+      db.prepare("INSERT INTO bridge_campaigns (external_id, name, workflow_id, run_id, list_id, account_id) VALUES (?,?,?,?,?,?)")
+        .run(externalId, label, workflowId, runId, listId, accountId);
+    }
+    db.prepare("INSERT OR IGNORE INTO bridge_campaign_runs (external_id, account_id, run_id, list_id, workflow_id) VALUES (?,?,?,?,?)")
+      .run(externalId, accountId, runId, listId, workflowId);
   })();
   return campaignRow(db, externalId, cfg, false);
 }
@@ -184,6 +230,7 @@ export function saveCampaignLimits(db: Db, externalId: string, meta?: CampaignMe
  * When no Console campaign is running the account goes back to its ceiling, so other Linki use is unaffected.
  */
 export function applyAccountLimits(db: Db, accountId: string) {
+  backfillRuns(db);
   const acc = db.prepare("SELECT daily_connection_limit AS c, daily_message_limit AS m FROM accounts WHERE id = ?").get(accountId) as { c: number | null; m: number | null } | undefined;
   if (!acc) return;
   let st = db.prepare("SELECT * FROM bridge_accounts WHERE account_id = ?").get(accountId) as
@@ -199,7 +246,8 @@ export function applyAccountLimits(db: Db, accountId: string) {
   }
   const run = db.prepare(`SELECT COALESCE(SUM(b.daily_invites),0) AS inv, COALESCE(SUM(b.daily_messages),0) AS msg,
                                  SUM(b.daily_invites IS NOT NULL) AS hasInv, SUM(b.daily_messages IS NOT NULL) AS hasMsg, COUNT(*) AS n
-                          FROM bridge_campaigns b JOIN runs r ON r.id = b.run_id WHERE b.account_id = ? AND r.status = 'running'`).get(accountId) as
+                          FROM bridge_campaign_runs x JOIN bridge_campaigns b ON b.external_id = x.external_id JOIN runs r ON r.id = x.run_id
+                          WHERE x.account_id = ? AND r.status = 'running'`).get(accountId) as
     { inv: number; msg: number; hasInv: number | null; hasMsg: number | null; n: number };
   // A running campaign that never told us its limits does not lower anything (the ceiling still protects the account).
   const allInv = run.n > 0 && run.hasInv === run.n; const allMsg = run.n > 0 && run.hasMsg === run.n;
@@ -212,33 +260,36 @@ export function applyAccountLimits(db: Db, accountId: string) {
 
 export function setCampaignStatus(db: Db, externalCampaignId: string, action: "start" | "pause" | "stop", meta?: CampaignMeta) {
   const out = setCampaignStatusInner(db, externalCampaignId, action, meta);
-  const camp = campaignRow(db, externalCampaignId, {}, false);
-  if (camp) applyAccountLimits(db, camp.account_id);
+  for (const r of runsOf(db, externalCampaignId)) applyAccountLimits(db, r.account_id);
   return out;
 }
 
+/** Start / pause / stop act on every run of the campaign (one per rep account). */
 function setCampaignStatusInner(db: Db, externalCampaignId: string, action: "start" | "pause" | "stop", meta?: CampaignMeta) {
-  const camp = campaignRow(db, externalCampaignId, {}, false);
-  if (!camp) throw new BridgeError(404, "campaign_not_found", "Linki has not seen this campaign yet. Enrol leads first.");
+  const runs = runsOf(db, externalCampaignId);
+  if (!runs.length) throw new BridgeError(404, "campaign_not_found", "Linki has not seen this campaign yet. Enrol leads first.");
   if (action === "start") saveCampaignLimits(db, externalCampaignId, meta);
-  const run = db.prepare("SELECT status FROM runs WHERE id = ?").get(camp.run_id) as { status: string };
+  const statusOf = (id: string) => (db.prepare("SELECT status FROM runs WHERE id = ?").get(id) as { status: string }).status;
+  const all = runs.map((r) => ({ r, status: statusOf(r.run_id) }));
   if (action === "start") {
-    if (run.status === "completed") throw new BridgeError(409, "campaign_stopped", "This campaign was stopped and cannot be started again.");
-    db.prepare("UPDATE runs SET status = 'running', started_at = COALESCE(started_at, datetime('now')) WHERE id = ?").run(camp.run_id);
+    const open = all.filter((x) => x.status !== "completed");
+    if (!open.length) throw new BridgeError(409, "campaign_stopped", "This campaign was stopped and cannot be started again.");
+    for (const x of open) db.prepare("UPDATE runs SET status = 'running', started_at = COALESCE(started_at, datetime('now')) WHERE id = ?").run(x.r.run_id);
     return { status: "running" };
   }
   if (action === "pause") {
-    if (run.status === "running") db.prepare("UPDATE runs SET status = 'paused' WHERE id = ?").run(camp.run_id);
-    return { status: run.status === "completed" ? "completed" : "paused" };
+    for (const x of all) if (x.status === "running") db.prepare("UPDATE runs SET status = 'paused' WHERE id = ?").run(x.r.run_id);
+    return { status: all.every((x) => x.status === "completed") ? "completed" : "paused" };
   }
   // stop
-  if (run.status !== "completed") {
-    db.transaction(() => {
+  db.transaction(() => {
+    for (const x of all) {
+      if (x.status === "completed") continue;
       db.prepare(`UPDATE run_profile_tracks SET state = 'skipped', error_message = 'Campaign stopped from the Console'
-                  WHERE state IN ('pending','in_progress') AND run_profile_id IN (SELECT id FROM run_profiles WHERE run_id = ?)`).run(camp.run_id);
-      db.prepare("UPDATE runs SET status = 'completed', completed_at = datetime('now') WHERE id = ?").run(camp.run_id);
-    })();
-  }
+                  WHERE state IN ('pending','in_progress') AND run_profile_id IN (SELECT id FROM run_profiles WHERE run_id = ?)`).run(x.r.run_id);
+      db.prepare("UPDATE runs SET status = 'completed', completed_at = datetime('now') WHERE id = ?").run(x.r.run_id);
+    }
+  })();
   return { status: "completed" };
 }
 
@@ -297,6 +348,11 @@ export function captureEvents(db: Db): number {
                 SELECT 'email_sent', t.external_id, COALESCE(MIN(rt.last_step_at), datetime('now'))
                 FROM targets t JOIN run_profiles rp ON rp.target_id = t.id JOIN run_profile_tracks rt ON rt.run_profile_id = rp.id
                 WHERE t.external_id IS NOT NULL AND rt.track = 'email' AND rt.last_email_subject IS NOT NULL GROUP BY t.external_id`).run();
+    // Tag each event with the LinkedIn account that worked the lead (its most recent run).
+    db.prepare(`UPDATE bridge_events SET account_id = (
+                  SELECT r.account_id FROM run_profiles rp JOIN runs r ON r.id = rp.run_id JOIN targets t ON t.id = rp.target_id
+                  WHERE t.external_id = bridge_events.external_lead_id ORDER BY rp.rowid DESC LIMIT 1)
+                WHERE account_id IS NULL`).run();
   })();
   return (db.prepare("SELECT COALESCE(MAX(id),0) AS m FROM bridge_events").get() as { m: number }).m - before;
 }
@@ -305,10 +361,10 @@ export function readEvents(db: Db, after: string | null, limit: number) {
   const lim = Math.max(1, Math.min(1000, Math.floor(limit) || 200));
   const cursor = after && /^\d+$/.test(after) ? Number(after) : 0;
   captureEvents(db);
-  const rows = db.prepare("SELECT id, type, external_lead_id, at FROM bridge_events WHERE id > ? ORDER BY id LIMIT ?").all(cursor, lim) as
-    { id: number; type: string; external_lead_id: string; at: string }[];
+  const rows = db.prepare("SELECT id, type, external_lead_id, at, account_id FROM bridge_events WHERE id > ? ORDER BY id LIMIT ?").all(cursor, lim) as
+    { id: number; type: string; external_lead_id: string; at: string; account_id: string | null }[];
   return {
-    events: rows.map((r) => ({ id: String(r.id), type: r.type, lead_id: r.external_lead_id, at: isoOf(r.at) })),
+    events: rows.map((r) => ({ id: String(r.id), type: r.type, lead_id: r.external_lead_id, at: isoOf(r.at), account_id: r.account_id })),
     next: rows.length ? String(rows[rows.length - 1].id) : (after ?? null),
   };
 }
