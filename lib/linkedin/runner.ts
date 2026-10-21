@@ -11,6 +11,7 @@ import { enrichProfile } from "@/lib/linkedin/enrich";
 import { matchPerson } from "@/lib/apollo";
 import { premium } from "@/lib/premium";
 import { inboxReplies } from "@/lib/linkedin/reply-sync";
+import { pushNewEvents } from "@/lib/bridge-push";
 import { decryptSecret } from "@/lib/crypto";
 
 // Minimum gap between Sales Nav profile enrichment calls per account (ms)
@@ -1027,6 +1028,9 @@ async function tick(db: ReturnType<typeof getDb>): Promise<void> {
       }
     }
   }
+
+  // Tell the Console about new events right away (optional; needs CONSOLE_WEBHOOK_URL + CONSOLE_WEBHOOK_SECRET).
+  try { await pushNewEvents(db); } catch { /* never let a Console problem stop sending */ }
 
   // Sync email IMAP inboxes for each unique email account in active run profiles
   const activeRunIds = activeRuns.map(r => r.run_id);
